@@ -7,7 +7,8 @@ const app = express();
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 const rooms = new Map();
 
@@ -50,6 +51,7 @@ app.get('/api/qr.png', async (req, res) => {
   }
 });
 
+// Pantalla de acceso y PIN
 app.get('/v', (req, res) => {
   const code = req.query.c;
   if (!code || !rooms.has(code)) {
@@ -101,19 +103,18 @@ app.get('/v', (req, res) => {
   `);
 });
 
-// Proxy mejorado para soportar estilos CSS, scripts y contenido completo
-app.get('/p', async (req, res) => {
+// Proxy Universal para capturar HTML, CSS, JS, imágenes y llamadas de botones (Fetch/XHR)
+app.all('/p', async (req, res) => {
   const code = req.query.c;
-  const subUrl = req.query.url; // Para subrecursos si los hubiera
+  const subUrl = req.query.url;
   const room = rooms.get(code);
 
   if (!room || !room.deviceWs || room.deviceWs.readyState !== 1) {
-    return res.status(503).send('La Compu 1 (extensión) no está conectada a la sala.');
+    return res.status(503).send('La extensión en la computadora no está conectada.');
   }
 
   const reqId = Math.random().toString(36).substring(2);
   const targetUrl = subUrl || room.startUrl || 'about:blank';
-  const isAsset = !!subUrl;
 
   const promise = new Promise((resolve) => {
     room.pendings.set(reqId, { resolve });
@@ -122,30 +123,35 @@ app.get('/p', async (req, res) => {
         room.pendings.delete(reqId);
         resolve({ ok: false, error: 'Tiempo de espera agotado.' });
       }
-    }, 15000);
+    }, 20000);
   });
 
   room.deviceWs.send(JSON.stringify({
     type: 'req',
     id: reqId,
     url: targetUrl,
-    method: 'GET',
-    kind: isAsset ? 'asset' : 'page'
+    method: req.method,
+    headers: req.headers,
+    body: req.body
   }));
 
   const data = await promise;
-  if (!data.ok) return res.status(500).send(data.error || 'Error al descargar el recurso.');
+  if (!data.ok) return res.status(500).send(data.error || 'Error en el recurso.');
 
   if (data.contentType) res.setHeader('Content-Type', data.contentType);
-  
+
   if (data.text) {
     let output = data.text;
-    // Reescribir rutas relativas si es HTML para que carguen a través del proxy
+    // Reescribe enlaces internos para que las interacciones y clics sigan pasando por el proxy
     if (/^text\/html/i.test(data.contentType)) {
-      output = output.replace(/(href|src)=["']([^"']+)["']/g, (match, attr, val) => {
-        if (val.startsWith('http') || val.startsWith('//') || val.startsWith('data:')) return match;
-        const resolved = new URL(val, targetUrl).toString();
-        return `${attr}="/p?c=${code}&url=${encodeURIComponent(resolved)}"`;
+      output = output.replace(/(href|src|action)=["']([^"']+)["']/g, (match, attr, val) => {
+        if (val.startsWith('http') || val.startsWith('//') || val.startsWith('data:') || val.startsWith('#')) return match;
+        try {
+          const resolved = new URL(val, targetUrl).toString();
+          return `${attr}="/p?c=${code}&url=${encodeURIComponent(resolved)}"`;
+        } catch {
+          return match;
+        }
       });
     }
     res.send(output);
