@@ -9,18 +9,14 @@ const wss = new WebSocketServer({ server });
 
 app.use(express.json());
 
-// Almacén en memoria de salas activas
 const rooms = new Map();
 
-// 1. Health check (para que Render y la extensión sepan que está activo)
 app.get('/health', (req, res) => {
   res.json({ ok: true });
 });
 
-// 2. Crear nueva sala desde la extensión (Compu 1)
 app.post('/api/room/create', (req, res) => {
-  const { pin, autoApprove, startUrl, deviceName } = req.body || {};
-  
+  const { pin, autoApprove, startUrl } = req.body || {};
   const code = Math.floor(100000 + Math.random() * 900000).toString();
   const deviceToken = Math.random().toString(36).substring(2) + Date.now().toString(36);
 
@@ -37,12 +33,9 @@ app.post('/api/room/create', (req, res) => {
   res.json({ ok: true, code, deviceToken });
 });
 
-// 3. Generador de código QR
 app.get('/api/qr.png', async (req, res) => {
   const { code } = req.query;
-  if (!code || !rooms.has(code)) {
-    return res.status(404).send('Sala no encontrada');
-  }
+  if (!code || !rooms.has(code)) return res.status(404).send('Sala no encontrada');
   const host = req.headers['x-forwarded-host'] || req.get('host');
   const proto = req.headers['x-forwarded-proto'] || req.protocol;
   const targetUrl = `${proto}://${host}/v?c=${code}`;
@@ -57,25 +50,13 @@ app.get('/api/qr.png', async (req, res) => {
   }
 });
 
-// 4. Interfaz web del visor (/v)
 app.get('/v', (req, res) => {
   const code = req.query.c;
   if (!code || !rooms.has(code)) {
-    return res.send(`
-      <!doctype html>
-      <html>
-      <head><meta charset="utf-8"><title>URLBridge</title></head>
-      <body style="background:#0b1020;color:#e8ecf8;font-family:sans-serif;text-align:center;padding:50px;">
-        <h2>Sala no encontrada o expirada</h2>
-        <p style="color:#9aa6c4">Abre la extensión en tu computadora y genera una sala nueva.</p>
-      </body>
-      </html>
-    `);
+    return res.send(`<h2>Sala no encontrada o expirada</h2>`);
   }
-
   const room = rooms.get(code);
 
-  // Formulario para ingresar el PIN si la sala requiere PIN
   res.send(`
     <!doctype html>
     <html lang="es">
@@ -120,9 +101,10 @@ app.get('/v', (req, res) => {
   `);
 });
 
-// 5. Proxy para solicitar páginas a la Compu 1
-app.get('/p', (req, res) => {
+// Proxy mejorado para soportar estilos CSS, scripts y contenido completo
+app.get('/p', async (req, res) => {
   const code = req.query.c;
+  const subUrl = req.query.url; // Para subrecursos si los hubiera
   const room = rooms.get(code);
 
   if (!room || !room.deviceWs || room.deviceWs.readyState !== 1) {
@@ -130,40 +112,50 @@ app.get('/p', (req, res) => {
   }
 
   const reqId = Math.random().toString(36).substring(2);
-  const targetUrl = room.startUrl || 'about:blank';
+  const targetUrl = subUrl || room.startUrl || 'about:blank';
+  const isAsset = !!subUrl;
 
-  const promise = new Promise((resolve, reject) => {
-    room.pendings.set(reqId, { resolve, reject });
+  const promise = new Promise((resolve) => {
+    room.pendings.set(reqId, { resolve });
     setTimeout(() => {
       if (room.pendings.has(reqId)) {
         room.pendings.delete(reqId);
-        resolve({ ok: false, error: 'Tiempo de espera agotado al obtener respuesta de la Compu 1.' });
+        resolve({ ok: false, error: 'Tiempo de espera agotado.' });
       }
     }, 15000);
   });
 
-  // Enviar orden de fetch a la extensión
   room.deviceWs.send(JSON.stringify({
     type: 'req',
     id: reqId,
     url: targetUrl,
-    method: 'GET'
+    method: 'GET',
+    kind: isAsset ? 'asset' : 'page'
   }));
 
-  promise.then((data) => {
-    if (!data.ok) return res.status(500).send(data.error || 'Error al descargar la página.');
-    if (data.contentType) res.setHeader('Content-Type', data.contentType);
-    if (data.text) {
-      res.send(data.text);
-    } else if (data.base64) {
-      res.send(Buffer.from(data.base64, 'base64'));
-    } else {
-      res.send('');
+  const data = await promise;
+  if (!data.ok) return res.status(500).send(data.error || 'Error al descargar el recurso.');
+
+  if (data.contentType) res.setHeader('Content-Type', data.contentType);
+  
+  if (data.text) {
+    let output = data.text;
+    // Reescribir rutas relativas si es HTML para que carguen a través del proxy
+    if (/^text\/html/i.test(data.contentType)) {
+      output = output.replace(/(href|src)=["']([^"']+)["']/g, (match, attr, val) => {
+        if (val.startsWith('http') || val.startsWith('//') || val.startsWith('data:')) return match;
+        const resolved = new URL(val, targetUrl).toString();
+        return `${attr}="/p?c=${code}&url=${encodeURIComponent(resolved)}"`;
+      });
     }
-  });
+    res.send(output);
+  } else if (data.base64) {
+    res.send(Buffer.from(data.base64, 'base64'));
+  } else {
+    res.send('');
+  }
 });
 
-// 6. Conexión WebSocket para la extensión
 wss.on('connection', (ws, req) => {
   const urlParams = new URLSearchParams(req.url.split('?')[1]);
   const code = urlParams.get('code');
@@ -171,13 +163,12 @@ wss.on('connection', (ws, req) => {
 
   const room = rooms.get(code);
   if (!room || room.deviceToken !== dt) {
-    ws.send(JSON.stringify({ type: 'error', error: 'La sala o el token no son válidos.' }));
+    ws.send(JSON.stringify({ type: 'error', error: 'Token inválido.' }));
     ws.close();
     return;
   }
 
   room.deviceWs = ws;
-  console.log(`[+] Extensión conectada a la sala ${code}`);
   ws.send(JSON.stringify({ type: 'ready' }));
 
   ws.on('message', (message) => {
@@ -188,20 +179,13 @@ wss.on('connection', (ws, req) => {
         room.pendings.delete(msg.id);
         p.resolve(msg);
       }
-    } catch (e) {
-      console.error('Error procesando mensaje:', e);
-    }
+    } catch {}
   });
 
   ws.on('close', () => {
-    if (room.deviceWs === ws) {
-      room.deviceWs = null;
-      console.log(`[-] Extensión desconectada de la sala ${code}`);
-    }
+    if (room.deviceWs === ws) room.deviceWs = null;
   });
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log(`Servidor URLBridge activo en puerto ${PORT}`);
-});
+server.listen(PORT);
