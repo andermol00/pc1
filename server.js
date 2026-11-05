@@ -9,19 +9,18 @@ const wss = new WebSocketServer({ server });
 
 app.use(express.json());
 
-// Almacén en memoria de las salas activas
+// Almacén en memoria de salas activas
 const rooms = new Map();
 
-// 1. Ruta de comprobación (Health Check)
+// 1. Health check (para que Render y la extensión sepan que está activo)
 app.get('/health', (req, res) => {
   res.json({ ok: true });
 });
 
-// 2. Crear nueva sala
+// 2. Crear nueva sala desde la extensión (Compu 1)
 app.post('/api/room/create', (req, res) => {
   const { pin, autoApprove, startUrl, deviceName } = req.body || {};
   
-  // Código único de 6 dígitos y token de seguridad para la Compu 1
   const code = Math.floor(100000 + Math.random() * 900000).toString();
   const deviceToken = Math.random().toString(36).substring(2) + Date.now().toString(36);
 
@@ -38,7 +37,7 @@ app.post('/api/room/create', (req, res) => {
   res.json({ ok: true, code, deviceToken });
 });
 
-// 3. Generar código QR dinámico
+// 3. Generador de código QR
 app.get('/api/qr.png', async (req, res) => {
   const { code } = req.query;
   if (!code || !rooms.has(code)) {
@@ -51,14 +50,14 @@ app.get('/api/qr.png', async (req, res) => {
   try {
     res.setHeader('Content-Type', 'image/png');
     QRCode.toStream(res, targetUrl, { width: 180, margin: 1 }, (err) => {
-      if (err && !res.headersSent) res.status(500).send('Error al generar QR');
+      if (err && !res.headersSent) res.status(500).send('Error QR');
     });
   } catch {
     if (!res.headersSent) res.status(500).send('Error interno');
   }
 });
 
-// 4. Interfaz del visor (/v)
+// 4. Interfaz web del visor (/v)
 app.get('/v', (req, res) => {
   const code = req.query.c;
   if (!code || !rooms.has(code)) {
@@ -68,7 +67,7 @@ app.get('/v', (req, res) => {
       <head><meta charset="utf-8"><title>URLBridge</title></head>
       <body style="background:#0b1020;color:#e8ecf8;font-family:sans-serif;text-align:center;padding:50px;">
         <h2>Sala no encontrada o expirada</h2>
-        <p style="color:#9aa6c4">Verifica el código o vuelve a generar una sala desde la extensión.</p>
+        <p style="color:#9aa6c4">Abre la extensión en tu computadora y genera una sala nueva.</p>
       </body>
       </html>
     `);
@@ -76,6 +75,7 @@ app.get('/v', (req, res) => {
 
   const room = rooms.get(code);
 
+  // Formulario para ingresar el PIN si la sala requiere PIN
   res.send(`
     <!doctype html>
     <html lang="es">
@@ -84,26 +84,86 @@ app.get('/v', (req, res) => {
       <title>URLBridge Viewer - Sala ${code}</title>
       <meta name="viewport" content="width=device-width, initial-scale=1">
       <style>
-        body { margin: 0; background: #0b1020; color: #e8ecf8; font-family: -apple-system, sans-serif; display: grid; place-items: center; min-height: 100vh; }
-        .card { background: #131a30; border: 1px solid #26304d; border-radius: 14px; padding: 24px; max-width: 380px; width: 90%; text-align: center; }
+        body { margin: 0; background: #0b1020; color: #e8ecf8; font-family: sans-serif; display: grid; place-items: center; min-height: 100vh; }
+        .card { background: #131a30; border: 1px solid #26304d; border-radius: 14px; padding: 24px; max-width: 360px; width: 90%; text-align: center; }
         h1 { font-size: 18px; margin-top: 0; color: #4f7cff; }
-        .code { font-family: monospace; font-size: 28px; font-weight: bold; letter-spacing: 4px; color: #b9c9ff; margin: 12px 0; }
-        .status { font-size: 13px; color: #86efac; background: #12251a; border: 1px solid #2f5236; border-radius: 20px; padding: 4px 12px; display: inline-block; }
+        input { width: 100%; box-sizing: border-box; padding: 10px; border-radius: 8px; border: 1px solid #26304d; background: #0b1020; color: #fff; font-size: 16px; margin: 12px 0; text-align: center; }
+        button { width: 100%; padding: 10px; background: #4f7cff; border: none; border-radius: 8px; color: #fff; font-weight: bold; cursor: pointer; font-size: 15px; }
       </style>
     </head>
     <body>
       <div class="card">
-        <h1>URLBridge Relé</h1>
-        <div class="status">● Conectado a la sala</div>
-        <div class="code">${code}</div>
-        <p style="font-size: 13px; color: #9aa6c4;">URL publicada originalmente:<br><b style="color:#fff">${room.startUrl}</b></p>
+        <h1>URLBridge Visor</h1>
+        <p style="font-size:13px;color:#9aa6c4">Conectando a la sala <b>${code}</b></p>
+        ${room.pin ? `
+          <input type="password" id="pinInput" placeholder="Introduce el PIN" maxlength="12" />
+          <button onclick="verificarPin()">Entrar</button>
+        ` : `
+          <button onclick="cargarSitio()">Ver pantalla</button>
+        `}
       </div>
+      <script>
+        function verificarPin() {
+          const pinIngresado = document.getElementById('pinInput').value;
+          if (pinIngresado === "${room.pin}") {
+            cargarSitio();
+          } else {
+            alert("PIN incorrecto");
+          }
+        }
+        function cargarSitio() {
+          document.body.innerHTML = '<iframe src="/p?c=${code}" style="width:100vw;height:100vh;border:none;position:fixed;top:0;left:0;"></iframe>';
+        }
+      </script>
     </body>
     </html>
   `);
 });
 
-// 5. Endpoint WebSocket para la extensión de Chrome
+// 5. Proxy para solicitar páginas a la Compu 1
+app.get('/p', (req, res) => {
+  const code = req.query.c;
+  const room = rooms.get(code);
+
+  if (!room || !room.deviceWs || room.deviceWs.readyState !== 1) {
+    return res.status(503).send('La Compu 1 (extensión) no está conectada a la sala.');
+  }
+
+  const reqId = Math.random().toString(36).substring(2);
+  const targetUrl = room.startUrl || 'about:blank';
+
+  const promise = new Promise((resolve, reject) => {
+    room.pendings.set(reqId, { resolve, reject });
+    setTimeout(() => {
+      if (room.pendings.has(reqId)) {
+        room.pendings.delete(reqId);
+        resolve({ ok: false, error: 'Tiempo de espera agotado al obtener respuesta de la Compu 1.' });
+      }
+    }, 15000);
+  });
+
+  // Enviar orden de fetch a la extensión
+  room.deviceWs.send(JSON.stringify({
+    type: 'req',
+    id: reqId,
+    url: targetUrl,
+    method: 'GET'
+  }));
+
+  promise.then((data) => {
+    if (!data.ok) return res.status(500).send(data.error || 'Error al descargar la página.');
+    if (data.contentType) res.setHeader('Content-Type', data.contentType);
+    if (data.text) {
+      res.send(data.text);
+    } else if (data.base64) {
+      res.send(Buffer.from(data.base64, 'base64'));
+    } else {
+      res.send('');
+    }
+  });
+});
+
+// 6. Conexión WebSocket para la extensión
 wss.on('connection', (ws, req) => {
   const urlParams = new URLSearchParams(req.url.split('?')[1]);
   const code = urlParams.get('code');
@@ -117,9 +177,7 @@ wss.on('connection', (ws, req) => {
   }
 
   room.deviceWs = ws;
-  console.log(`[+] Extensión (Compu 1) conectada exitosamente a la sala ${code}`);
-
-  // Confirmar conexión lista
+  console.log(`[+] Extensión conectada a la sala ${code}`);
   ws.send(JSON.stringify({ type: 'ready' }));
 
   ws.on('message', (message) => {
@@ -135,7 +193,7 @@ wss.on('connection', (ws, req) => {
     }
   });
 
-  ws.on.call(ws, 'close', () => {
+  ws.on('close', () => {
     if (room.deviceWs === ws) {
       room.deviceWs = null;
       console.log(`[-] Extensión desconectada de la sala ${code}`);
