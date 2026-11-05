@@ -1,0 +1,17 @@
+{
+  "name": "urlbridge-server",
+  "version": "1.0.0",
+  "description": "Servidor relé WebSockets y HTTP para la extensión URLBridge",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "ws": "^8.13.0",
+    "qrcode": "^1.5.3"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}
